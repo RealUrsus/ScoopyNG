@@ -3,6 +3,9 @@
 *
 * Author:  Tobias Klein, 2008 [ www.trapkit.de ]
 * Modified by: Real Ursus, 2016  (North Pole)
+* Added:
+* - cpuid Test (0)
+* - Virtual BIOS DMI information Test (8)
 */
 #include <stdio.h>
 #include <windows.h>
@@ -319,7 +322,7 @@ void test3()
 	}
 }
 
-// Alfredo Andrés Omella's (S21sec) STR technique
+// Alfredo AndrÃ©s Omella's (S21sec) STR technique
 void test4()
 {
 	unsigned char	mem[4] = { 0, 0, 0, 0 };
