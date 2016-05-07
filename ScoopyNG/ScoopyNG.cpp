@@ -1,17 +1,21 @@
 /* ScoopyNG - The VMware detection tool
-* Version v1.1
+* Version v1.2
 *
 * Author:  Tobias Klein, 2008 [ www.trapkit.de ]
 * Modified by: Real Ursus, 2016  (North Pole)
 * Added:
 * - cpuid Test (0)
 * - Virtual BIOS DMI information Test (8)
+* - Virtual Adapter Test (9)
 */
+#include <winsock2.h>
+#include <iphlpapi.h>
 #include <stdio.h>
 #include <windows.h>
 #include <excpt.h>
 #include <intrin.h>
 #include <iostream>
+#include <string>
 #include <comdef.h>
 #include <comutil.h>
 #include <Wbemidl.h>
@@ -20,10 +24,14 @@ using namespace std;
 
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "comsuppw.lib")
+#pragma comment(lib, "IPHLPAPI.lib")
 
 #define DEBUG	0
 #define _WIN32_DCOM
 #define EndUserModeAddress (*(UINT_PTR*)0x7FFE02B4)
+#define MALLOC(x) HeapAlloc(GetProcessHeap(), 0, (x))
+#define FREE(x) HeapFree(GetProcessHeap(), 0, (x))
+
 
 typedef LONG(NTAPI *NTSETLDTENTRIES)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
 
@@ -188,6 +196,82 @@ BSTR GetBIOS()
 	CoUninitialize();
 
 	return SerialNumber;
+}
+
+bool isVMWareMAC()
+{
+	DWORD dwSize{ 0 };
+	DWORD dwRetVal{ 0 };
+	LPVOID lpMsgBuf{ NULL };
+	PIP_ADAPTER_ADDRESSES pAddresses, pCurrAddresses{ NULL };
+	ULONG outBufLen{ 0 };
+	unsigned int i{ 0 };
+	bool isVMWare{ FALSE };
+	outBufLen = sizeof(IP_ADAPTER_ADDRESSES);
+	pAddresses = (IP_ADAPTER_ADDRESSES *)MALLOC(outBufLen);
+
+	// Make an initial call to GetAdaptersAddresses to get the  size needed into the outBufLen variable
+	if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen) == ERROR_BUFFER_OVERFLOW)
+	{
+		FREE(pAddresses);
+		pAddresses = (IP_ADAPTER_ADDRESSES *)MALLOC(outBufLen);
+	}
+
+	if (pAddresses == NULL) {
+		printf("Memory allocation failed for IP_ADAPTER_ADDRESSES struct\n");
+		exit(1);
+	}
+
+	// Make a second call to GetAdapters Addresses to get the actual data
+	dwRetVal = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen);
+
+	if (dwRetVal == NO_ERROR) {
+		pCurrAddresses = pAddresses;
+
+
+		while (pCurrAddresses) {
+			printf("\tAdapter name: %s\n", pCurrAddresses->AdapterName);
+			printf("\tDescription: %wS\n", pCurrAddresses->Description);
+			printf("\tFriendly name: %wS\n", pCurrAddresses->FriendlyName);
+
+			if ((pCurrAddresses->PhysicalAddressLength != 0) && (pCurrAddresses->PhysicalAddressLength <= 6)) {
+				string MAC;
+				printf("\tPhysical address (MAC): ");
+				for (i = 0; i < pCurrAddresses->PhysicalAddressLength; i++) {
+					if (i == (pCurrAddresses->PhysicalAddressLength - 1)) {
+						printf("%.2X\n", (int)pCurrAddresses->PhysicalAddress[i]);
+						if (MAC.substr(0, 5) == "08086" || MAC.substr(0, 5) == "01241") {
+							isVMWare = TRUE;
+						}
+					}
+					else {
+						printf("%.2X-", (int)pCurrAddresses->PhysicalAddress[i]);						
+						MAC += std::to_string(pCurrAddresses->PhysicalAddress[i]);
+					}
+				}
+			}
+
+			printf("\n");
+
+			pCurrAddresses = pCurrAddresses->Next;
+		}
+	}
+	else {
+		printf("Call to GetAdaptersAddresses failed with error: %d\n", dwRetVal);
+		if (dwRetVal == ERROR_NO_DATA)
+			printf("\tNo addresses were found for the requested parameters\n");
+		else {
+
+			if (FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, dwRetVal, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)& lpMsgBuf, 0, NULL)) {
+				printf("\tError: %s", (char *)lpMsgBuf);
+				LocalFree(lpMsgBuf);
+				FREE(pAddresses);
+				exit(1);
+			}
+		}
+	}
+	FREE(pAddresses);
+	return isVMWare;
 }
 
 
@@ -486,19 +570,27 @@ void test8()
 	char * SerialNumber = _com_util::ConvertBSTRToString(GetBIOS());
 
 	if (!memcmp(SerialNumber, "VMware-", 7) || !memcmp(SerialNumber, "VMW", 3))	
-		cout << "Result  : DMI contains VMware specific string: " << SerialNumber << "\n\n" << endl;
+		cout << "Result  : DMI contains VMware specific string: " << SerialNumber << "\n" << endl;
 	else
-		cout << "Result  : Native OS" << "\n\n"<< endl;
-
-
+		cout << "Result  : Native OS" << "\n"<< endl;
 }
 
+void test9()
+{
+	cout << "[+] Test 9: Virtual Adapter" << endl;
+	cout << "OS Adapter details:" << endl;
+
+	if (isVMWareMAC())
+		cout << "Result  : VMware specific Adapter has been detected" << "\n\n" << endl;
+	else
+		cout << "Result  : Native OS" << "\n\n" << endl;
+}
 
 int main()
 {
 	printf("\n\n####################################################\n");
 	printf("::       ScoopyNG - The VMware Detection Tool     ::\n");
-	printf("::              Windows version v1.1              ::\n\n");
+	printf("::              Windows version v1.2              ::\n\n");
 
 
 	SYSTEM_INFO siSysInfo;
@@ -521,9 +613,10 @@ int main()
 	test6();
 	test7();
 	test8();
+	test9();
 
-	printf("::    Author: Tobias Klein (www.trapkit.de)       ::\n");
-	printf("::    Extended by: Real Ursus (North Pole)        ::\n");
+	printf(":: Original Author: Tobias Klein (www.trapkit.de) ::\n");
+	printf("::     Extended by: Real Ursus (North Pole)       ::\n");
 	printf("####################################################\n\n");
 
 	return 0;
