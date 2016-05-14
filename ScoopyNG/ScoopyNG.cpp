@@ -593,8 +593,7 @@ int main()
 	printf("::              Windows version v1.2              ::\n\n");
 
 
-	SYSTEM_INFO siSysInfo;
-	
+	SYSTEM_INFO siSysInfo;	
 	GetSystemInfo(&siSysInfo);
 
 	printf("Hardware information: \n");
@@ -613,7 +612,6 @@ int main()
 	unsigned int seconds = uptime / (1000);
 
 	cout << "System Uptime is: " << days << " days " << hours  << " hours " << minutes << " minutes " << seconds << " seconds" << "\n" << endl;
-
 
 	test0();
 	test1();
