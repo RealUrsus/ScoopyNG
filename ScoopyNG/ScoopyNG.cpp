@@ -594,7 +594,7 @@ int main()
 
 
 	SYSTEM_INFO siSysInfo;
-
+	
 	GetSystemInfo(&siSysInfo);
 
 	printf("Hardware information: \n");
@@ -603,6 +603,17 @@ int main()
 	printf("  Processor Revision: %u\n", siSysInfo.wProcessorRevision);
 	printf("  Page size: %u\n\n", siSysInfo.dwPageSize);
 	
+	DWORD uptime = GetTickCount();	
+	unsigned int days = uptime / (24 * 60 * 60 * 1000);
+	uptime %= (24 * 60 * 60 * 1000);
+	unsigned int hours = uptime / (60 * 60 * 1000);
+	uptime %= (60 * 60 * 1000);
+	unsigned int minutes = uptime / (60 * 1000);
+	uptime %= (60 * 1000);
+	unsigned int seconds = uptime / (1000);
+
+	cout << "System Uptime is: " << days << " days " << hours  << " hours " << minutes << " minutes " << seconds << " seconds" << "\n" << endl;
+
 
 	test0();
 	test1();
