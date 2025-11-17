@@ -153,14 +153,33 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <Text Include="ReadMe.txt" />
+    <Text Include="License.txt" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="ScoopyNG.cpp" />
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="VmwareDetector.cpp" />
+    <ClCompile Include="HyperVDetector.cpp" />
+    <ClCompile Include="VirtualBoxDetector.cpp" />
+    <ClCompile Include="ProxmoxDetector.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="DetectionTypes.h" />
+    <ClInclude Include="IDetectionTest.h" />
+    <ClInclude Include="Helpers.h" />
+    <ClInclude Include="VmwareDetector.h" />
+    <ClInclude Include="HyperVDetector.h" />
+    <ClInclude Include="VirtualBoxDetector.h" />
+    <ClInclude Include="ProxmoxDetector.h" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="ScoopyNG_x64.asm">
       <ExcludedFromBuild Condition="'$(Platform)'=='Win32'">true</ExcludedFromBuild>
     </MASM>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="ScoopyNG.cpp">
+      <ExcludedFromBuild>true</ExcludedFromBuild>
+    </None>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
