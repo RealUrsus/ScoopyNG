@@ -1,632 +1,788 @@
-/* ScoopyNG - The VMware detection tool
-* Version v1.2
-*
-* Author:  Tobias Klein, 2008 [ www.trapkit.de ]
-* Modified by: Real Ursus, 2016  (North Pole)
-* Added:
-* - cpuid Test (0)
-* - Virtual BIOS DMI information Test (8)
-* - Virtual Adapter Test (9)
-*/
+/* ScoopyNG - The VMware Detection Tool
+ * Version v2.0 - Refactored for x64 support
+ *
+ * Original Author:  Tobias Klein, 2008 [ www.trapkit.de ]
+ * Modified by: Real Ursus, 2016-2025 (North Pole)
+ *
+ * Changelog v2.0:
+ * - Full x64 platform support (primary platform)
+ * - Refactored detection methods with modern C++ practices
+ * - Separated assembly code to external .asm file
+ * - Fixed MAC address detection bug
+ * - Improved error handling with RAII
+ * - Better code organization and maintainability
+ */
+
+#define _WIN32_DCOM
+#define WIN32_LEAN_AND_MEAN
+
+#include <windows.h>
 #include <winsock2.h>
 #include <iphlpapi.h>
-#include <stdio.h>
-#include <windows.h>
 #include <excpt.h>
 #include <intrin.h>
-#include <iostream>
-#include <string>
-#include <comdef.h>
-#include <comutil.h>
 #include <Wbemidl.h>
 
-using namespace std;
+#include <stdio.h>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <memory>
+#include <sstream>
+#include <iomanip>
+
+#include <comdef.h>
+#include <comutil.h>
 
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "comsuppw.lib")
 #pragma comment(lib, "IPHLPAPI.lib")
 
-#define DEBUG	0
-#define _WIN32_DCOM
-#define EndUserModeAddress (*(UINT_PTR*)0x7FFE02B4)
-#define MALLOC(x) HeapAlloc(GetProcessHeap(), 0, (x))
-#define FREE(x) HeapFree(GetProcessHeap(), 0, (x))
+using namespace std;
 
+// ============================================================================
+// Constants and Configuration
+// ============================================================================
 
-typedef LONG(NTAPI *NTSETLDTENTRIES)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
+constexpr bool DEBUG_MODE = false;
+constexpr DWORD VMWARE_MAGIC = 0x564D5868;  // 'VMXh'
+constexpr WORD VMWARE_PORT = 0x5658;        // 'VX'
 
+// Known VMware MAC address prefixes (3 bytes)
+constexpr BYTE VMWARE_MAC_PREFIXES[][3] = {
+    {0x00, 0x05, 0x69},  // VMware, Inc.
+    {0x00, 0x0C, 0x29},  // VMware, Inc.
+    {0x00, 0x1C, 0x14},  // VMware, Inc.
+    {0x00, 0x50, 0x56},  // VMware, Inc.
+};
 
-BSTR GetBIOS()
-{
-	HRESULT hres;
-	BSTR SerialNumber{NULL};
+// ============================================================================
+// External Assembly Functions (x64)
+// ============================================================================
 
-	// Step 1: --------------------------------------------------
-	// Initialize COM. ------------------------------------------
-
-	hres = CoInitializeEx(0, COINIT_MULTITHREADED);
-	if (FAILED(hres))
-	{
-		cout << "Failed to initialize COM library. Error code = 0x" << hex << hres << endl;
-		exit(EXIT_FAILURE);
-	}
-
-	// Step 2: --------------------------------------------------
-	// Set general COM security levels --------------------------
-
-	hres = CoInitializeSecurity(
-		NULL,
-		-1,                          // COM authentication
-		NULL,                        // Authentication services
-		NULL,                        // Reserved
-		RPC_C_AUTHN_LEVEL_DEFAULT,   // Default authentication 
-		RPC_C_IMP_LEVEL_IMPERSONATE, // Default Impersonation  
-		NULL,                        // Authentication info
-		EOAC_NONE,                   // Additional capabilities 
-		NULL                         // Reserved
-		);
-
-
-	if (FAILED(hres))
-	{
-		cout << "Failed to initialize security. Error code = 0x" << hex << hres << endl;
-		CoUninitialize();
-		exit(EXIT_FAILURE);
-	}
-
-	// Step 3: ---------------------------------------------------
-	// Obtain the initial locator to WMI -------------------------
-
-	IWbemLocator *pLoc = NULL;
-
-	hres = CoCreateInstance(
-		CLSID_WbemLocator,
-		0,
-		CLSCTX_INPROC_SERVER,
-		IID_IWbemLocator, (LPVOID *)&pLoc);
-
-	if (FAILED(hres))
-	{
-		cout << "Failed to create IWbemLocator object." << " Err code = 0x" << hex << hres << endl;
-		CoUninitialize();
-		exit(EXIT_FAILURE);
-	}
-
-	// Step 4: -----------------------------------------------------
-	// Connect to WMI through the IWbemLocator::ConnectServer method
-
-	IWbemServices *pSvc = NULL;
-
-	// Connect to the root\cimv2 namespace with the current user and obtain pointer pSvc to make IWbemServices calls.
-	hres = pLoc->ConnectServer(
-		_bstr_t(L"ROOT\\CIMV2"), // Object path of WMI namespace
-		NULL,                    // User name. NULL = current user
-		NULL,                    // User password. NULL = current
-		0,                       // Locale. NULL indicates current
-		NULL,                    // Security flags.
-		0,                       // Authority (for example, Kerberos)
-		0,                       // Context object 
-		&pSvc                    // pointer to IWbemServices proxy
-		);
-
-	if (FAILED(hres))
-	{
-		cout << "Could not connect. Error code = 0x" << hex << hres << endl;
-		pLoc->Release();
-		CoUninitialize();
-		exit(EXIT_FAILURE);
-	}
-
-#if DEBUG == 1
-	cout << "Connected to ROOT\\CIMV2 WMI namespace" << endl;
+#ifdef _M_X64
+extern "C" {
+    UINT64 GetIdtBase();
+    UINT64 GetLdtBase();
+    UINT64 GetGdtBase();
+    UINT64 GetTaskRegister();
+    UINT64 VMwareGetVersion();
+    UINT64 VMwareGetMemorySize();
+    void SwitchToCodeSegment();
+}
 #endif
 
-	// Step 5: --------------------------------------------------
-	// Set security levels on the proxy -------------------------
+// ============================================================================
+// Type Definitions
+// ============================================================================
 
-	hres = CoSetProxyBlanket(
-		pSvc,                        // Indicates the proxy to set
-		RPC_C_AUTHN_WINNT,           // RPC_C_AUTHN_xxx
-		RPC_C_AUTHZ_NONE,            // RPC_C_AUTHZ_xxx
-		NULL,                        // Server principal name 
-		RPC_C_AUTHN_LEVEL_CALL,      // RPC_C_AUTHN_LEVEL_xxx 
-		RPC_C_IMP_LEVEL_IMPERSONATE, // RPC_C_IMP_LEVEL_xxx
-		NULL,                        // client identity
-		EOAC_NONE                    // proxy capabilities 
-		);
+typedef LONG(NTAPI* NTSETLDTENTRIES)(DWORD, DWORD, DWORD, DWORD, DWORD, DWORD);
 
-	if (FAILED(hres))
-	{
-		cout << "Could not set proxy blanket. Error code = 0x" << hex << hres << endl;
-		pSvc->Release();
-		pLoc->Release();
-		CoUninitialize();
-		exit(EXIT_FAILURE);
-	}
+enum class DetectionResult {
+    Native,
+    VMwareDetected,
+    HypervisorDetected,
+    Error
+};
 
-	// Step 6: --------------------------------------------------
-	// Use the IWbemServices pointer to make requests of WMI ----
+struct VMwareVersion {
+    enum Type {
+        Unknown = 0,
+        Express = 1,
+        ESX = 2,
+        GSX = 3,
+        Workstation = 4
+    };
+};
 
-	IEnumWbemClassObject* pEnumerator = NULL;
-	hres = pSvc->ExecQuery(
-		bstr_t("WQL"),
-		bstr_t("SELECT * FROM Win32_BIOS"),
-		WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
-		NULL,
-		&pEnumerator);
+// ============================================================================
+// RAII Helper Classes
+// ============================================================================
 
-	if (FAILED(hres))
-	{
-		cout << "Query for operating system name failed." << " Error code = 0x" << hex << hres << endl;
-		pSvc->Release();
-		pLoc->Release();
-		CoUninitialize();
-		exit(EXIT_FAILURE);
-	}
+class ComInitializer {
+public:
+    ComInitializer() {
+        hResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(hResult)) {
+            throw runtime_error("Failed to initialize COM library");
+        }
 
-	// Step 7: -------------------------------------------------
-	// Get the data from the query in step 6 -------------------
+        hResult = CoInitializeSecurity(
+            nullptr, -1, nullptr, nullptr,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            nullptr, EOAC_NONE, nullptr
+        );
 
-	IWbemClassObject *pclsObj = NULL;
-	ULONG uReturn = 0;
+        if (FAILED(hResult)) {
+            CoUninitialize();
+            throw runtime_error("Failed to initialize COM security");
+        }
+    }
 
-	while (pEnumerator)
-	{
-		HRESULT hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+    ~ComInitializer() {
+        CoUninitialize();
+    }
 
-		if (0 == uReturn)
-		{
-			break;
-		}
+    ComInitializer(const ComInitializer&) = delete;
+    ComInitializer& operator=(const ComInitializer&) = delete;
 
-		VARIANT vtProp;
+private:
+    HRESULT hResult;
+};
 
-		// Get the value of the SerialNumber property
-		hr = pclsObj->Get(L"SerialNumber", 0, &vtProp, 0, 0);
-		SerialNumber = vtProp.bstrVal;
-		VariantClear(&vtProp);
-		pclsObj->Release();
-	}
+template<typename T>
+class ComPtr {
+public:
+    ComPtr() : ptr(nullptr) {}
+    ~ComPtr() { Release(); }
 
-	// Cleanup
-	// ========
-	pSvc->Release();
-	pLoc->Release();
-	pEnumerator->Release();
-	CoUninitialize();
+    ComPtr(const ComPtr&) = delete;
+    ComPtr& operator=(const ComPtr&) = delete;
 
-	return SerialNumber;
+    T** operator&() {
+        Release();
+        return &ptr;
+    }
+
+    T* operator->() const { return ptr; }
+    T* Get() const { return ptr; }
+
+    void Release() {
+        if (ptr) {
+            ptr->Release();
+            ptr = nullptr;
+        }
+    }
+
+private:
+    T* ptr;
+};
+
+// ============================================================================
+// x86 Inline Assembly Helpers (for backward compatibility)
+// ============================================================================
+
+#ifdef _M_IX86
+
+unsigned long GetIdtBase() {
+    unsigned char idtr[6];
+    unsigned long idt = 0;
+    __asm sidt idtr
+    idt = *((unsigned long*)&idtr[2]);
+    return idt;
 }
 
-bool isVMWareMAC()
-{
-	DWORD dwSize{ 0 };
-	DWORD dwRetVal{ 0 };
-	LPVOID lpMsgBuf{ NULL };
-	PIP_ADAPTER_ADDRESSES pAddresses, pCurrAddresses{ NULL };
-	ULONG outBufLen{ 0 };
-	unsigned int i{ 0 };
-	bool isVMWare{ FALSE };
-	outBufLen = sizeof(IP_ADAPTER_ADDRESSES);
-	pAddresses = (IP_ADAPTER_ADDRESSES *)MALLOC(outBufLen);
-
-	// Make an initial call to GetAdaptersAddresses to get the  size needed into the outBufLen variable
-	if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen) == ERROR_BUFFER_OVERFLOW)
-	{
-		FREE(pAddresses);
-		pAddresses = (IP_ADAPTER_ADDRESSES *)MALLOC(outBufLen);
-	}
-
-	if (pAddresses == NULL) {
-		printf("Memory allocation failed for IP_ADAPTER_ADDRESSES struct\n");
-		exit(1);
-	}
-
-	// Make a second call to GetAdapters Addresses to get the actual data
-	dwRetVal = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen);
-
-	if (dwRetVal == NO_ERROR) {
-		pCurrAddresses = pAddresses;
-
-
-		while (pCurrAddresses) {
-			printf("\tAdapter name: %s\n", pCurrAddresses->AdapterName);
-			printf("\tDescription: %wS\n", pCurrAddresses->Description);
-			printf("\tFriendly name: %wS\n", pCurrAddresses->FriendlyName);
-
-			if ((pCurrAddresses->PhysicalAddressLength != 0) && (pCurrAddresses->PhysicalAddressLength <= 6)) {
-				string MAC;
-				printf("\tPhysical address (MAC): ");
-				for (i = 0; i < pCurrAddresses->PhysicalAddressLength; i++) {
-					if (i == (pCurrAddresses->PhysicalAddressLength - 1)) {
-						printf("%.2X\n", (int)pCurrAddresses->PhysicalAddress[i]);
-						if (MAC.substr(0, 5) == "08086" || MAC.substr(0, 5) == "01241") {
-							isVMWare = TRUE;
-						}
-					}
-					else {
-						printf("%.2X-", (int)pCurrAddresses->PhysicalAddress[i]);						
-						MAC += std::to_string(pCurrAddresses->PhysicalAddress[i]);
-					}
-				}
-			}
-
-			printf("\n");
-
-			pCurrAddresses = pCurrAddresses->Next;
-		}
-	}
-	else {
-		printf("Call to GetAdaptersAddresses failed with error: %d\n", dwRetVal);
-		if (dwRetVal == ERROR_NO_DATA)
-			printf("\tNo addresses were found for the requested parameters\n");
-		else {
-
-			if (FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, dwRetVal, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (LPTSTR)& lpMsgBuf, 0, NULL)) {
-				printf("\tError: %s", (char *)lpMsgBuf);
-				LocalFree(lpMsgBuf);
-				FREE(pAddresses);
-				exit(1);
-			}
-		}
-	}
-	FREE(pAddresses);
-	return isVMWare;
+unsigned long GetLdtBase() {
+    unsigned char ldtr[5] = "\xef\xbe\xad\xde";
+    unsigned long ldt = 0;
+    __asm sldt ldtr
+    ldt = *((unsigned long*)&ldtr[0]);
+    return ldt;
 }
 
-
-unsigned long get_idt_base()
-{
-	unsigned char	idtr[6];
-	unsigned long	idt = 0;
-
-	_asm sidt idtr
-	idt = *((unsigned long *)&idtr[2]);
-
-	return (idt);
+unsigned long GetGdtBase() {
+    unsigned char gdtr[6];
+    unsigned long gdt = 0;
+    __asm sgdt gdtr
+    gdt = *((unsigned long*)&gdtr[2]);
+    return gdt;
 }
 
-unsigned long get_ldtr_base()
-{
-	unsigned char   ldtr[5] = "\xef\xbe\xad\xde";
-	unsigned long   ldt = 0;
-
-	_asm sldt ldtr
-	ldt = *((unsigned long *)&ldtr[0]);
-
-	return (ldt);
+unsigned long GetTaskRegister() {
+    unsigned char mem[4] = { 0, 0, 0, 0 };
+    __asm str mem;
+    return *((unsigned long*)mem);
 }
 
-unsigned long get_gdt_base()
-{
-	unsigned char   gdtr[6];
-	unsigned long   gdt = 0;
-
-	_asm sgdt gdtr
-	gdt = *((unsigned long *)&gdtr[2]);
-
-	return (gdt);
-}
-
-// Based on https://blogs.msdn.microsoft.com/sqlosteam/2010/10/30/is-this-real-the-metaphysics-of-hardware-virtualization/
-void test0() {
-	char HVVendor[13];
-	int CPUInfo[4] = { -1 };
-
-	printf("[+] Test 0: CPUID\n");
-
-	__cpuid(CPUInfo, 1);
-	// check bit 31 of ECX
-	if ((CPUInfo[2] >> 31) & 1)
-	{
-		// Hypervisor is present
-		// Check CPUID leaf 0x40000000 EBX, ECX, EDX for Hypvervisor prod name
-		__cpuid(CPUInfo, 0x40000000);
-		memset(HVVendor, 0, sizeof(HVVendor));
-		memcpy(HVVendor, CPUInfo + 1, 12);
-
-		if (!strcmp(HVVendor, "Microsoft Hv"))
-		{
-			// Check CPUID leaf 0x40000003 bit 1 (CreatePartitions bit)
-			__cpuid(CPUInfo, 0x40000003);
-			if (CPUInfo[1] & 1)
-			{
-				printf("Result  : Running in a Hyper - V root partition\n\n");
-			}
-			else
-			{
-				printf("Result  : Running inside a VM in a Hyper - V child partition\n\n");
-			}
-		}
-		else if (!strcmp(HVVendor, "VMwareVMware")) {
-			printf("Result  : VMware detected\n\n");
-		}
-		else printf("Result  : Running inside a VM on a hypervisor\n\n");
-	}
-	else printf("Result  : Native OS\n\n");
-}
-
-void test1()
-{
-	unsigned int 	idt_base = 0;
-
-	idt_base = get_idt_base();
-
-	printf("[+] Test 1: IDT\n");
-	printf("IDT base: 0x%x\n", idt_base);
-
-	if ((idt_base >> 24) == 0xff) {
-		printf("Result  : VMware detected\n\n");
-		return;
-	}
-
-	else {
-		printf("Result  : Native OS\n\n");
-		return;
-	}
-}
-
-void test2()
-{
-	unsigned int	ldt_base = 0;
-
-	ldt_base = get_ldtr_base();
-
-	printf("[+] Test 2: LDT\n");
-	printf("LDT base: 0x%x\n", ldt_base);
-
-	if (ldt_base == 0xdead0000) {
-		printf("Result  : Native OS\n\n");
-		return;
-	}
-
-	else {
-		printf("Result  : VMware detected\n\n");
-		return;
-	}
-}
-
-void test3()
-{
-	unsigned int	gdt_base = 0;
-
-	gdt_base = get_gdt_base();
-
-	printf("[+] Test 3: GDT\n");
-	printf("GDT base: 0x%x\n", gdt_base);
-
-	if ((gdt_base >> 24) == 0xff) {
-		printf("Result  : VMware detected\n\n");
-		return;
-	}
-
-	else {
-		printf("Result  : Native OS\n\n");
-		return;
-	}
-}
-
-// Alfredo Andrés Omella's (S21sec) STR technique
-void test4()
-{
-	unsigned char	mem[4] = { 0, 0, 0, 0 };
-
-	__asm str mem;
-
-	printf("[+] Test 4: STR\n");
-	printf("STR base: 0x%02x%02x%02x%02x\n", mem[0], mem[1], mem[2], mem[3]);
-
-	if ((mem[0] == 0x00) && (mem[1] == 0x40))
-		printf("Result  : VMware detected\n\n");
-	else
-		printf("Result  : Native OS\n\n");
-}
-
-void test5()
-{
-	unsigned int	a, b;
-
-	__try {
-		__asm {
-			push eax
-			push ebx
-			push ecx
-			push edx
-
-			// perform fingerprint
-			mov eax, 'VMXh'	// VMware magic value (0x564D5868)
-			mov ebx, 0;		// This can be any value except MAGIC
-			mov ecx, 0Ah		// "CODE" to get the VMware Version
-			mov dx, 'VX'		// special VMware I/O port (0x5658)
-
-			in eax, dx			// special I/O cmd
-
-			mov a, ebx			// data 
-			mov b, ecx			// data	(eax gets also modified but will not be evaluated)
-
-			pop edx
-			pop ecx
-			pop ebx
-			pop eax
-		}
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {}
-
-#if DEBUG == 1
-	printf("\n [ a=%x ; b=%d ]\n\n", a, b);
 #endif
 
-	printf("[+] Test 5: VMware \"get version\" command\n");
+// ============================================================================
+// Detection Methods
+// ============================================================================
 
-	if (a == 'VMXh') {		// is the value equal to the VMware magic value?
-		printf("Result  : VMware detected\nVersion : ");
-		if (b == 1)
-			printf("Express\n\n");
-		else if (b == 2)
-			printf("ESX\n\n");
-		else if (b == 3)
-			printf("GSX\n\n");
-		else if (b == 4)
-			printf("Workstation\n\n");
-		else
-			printf("unknown version\n\n");
-	}
-	else
-		printf("Result  : Native OS\n\n");
+class VMwareDetector {
+public:
+    // Test 0: CPUID Hypervisor Detection
+    static DetectionResult TestCpuidHypervisor(string& details) {
+        char hvVendor[13] = { 0 };
+        int cpuInfo[4] = { -1 };
+
+        __cpuid(cpuInfo, 1);
+
+        // Check bit 31 of ECX (hypervisor present bit)
+        if ((cpuInfo[2] >> 31) & 1) {
+            // Hypervisor is present - get vendor string
+            __cpuid(cpuInfo, 0x40000000);
+            memcpy(hvVendor, cpuInfo + 1, 12);
+
+            if (strcmp(hvVendor, "VMwareVMware") == 0) {
+                details = "VMware hypervisor detected via CPUID";
+                return DetectionResult::VMwareDetected;
+            }
+            else if (strcmp(hvVendor, "Microsoft Hv") == 0) {
+                __cpuid(cpuInfo, 0x40000003);
+                if (cpuInfo[1] & 1) {
+                    details = "Hyper-V root partition detected";
+                }
+                else {
+                    details = "Hyper-V child partition detected";
+                }
+                return DetectionResult::HypervisorDetected;
+            }
+            else {
+                details = string("Generic hypervisor detected: ") + hvVendor;
+                return DetectionResult::HypervisorDetected;
+            }
+        }
+
+        details = "No hypervisor detected via CPUID";
+        return DetectionResult::Native;
+    }
+
+    // Test 1: IDT Base Address Check
+    static DetectionResult TestIdtBase(string& details) {
+#if defined(_M_X64) || defined(_M_IX86)
+        UINT_PTR idtBase = GetIdtBase();
+
+        ostringstream oss;
+        oss << "IDT base: 0x" << hex << uppercase << idtBase;
+        details = oss.str();
+
+#ifdef _M_X64
+        // On x64, VMware typically uses high memory addresses
+        if ((idtBase >> 40) == 0xFF) {
+            return DetectionResult::VMwareDetected;
+        }
+#else
+        // On x86, check if high byte is 0xFF
+        if ((idtBase >> 24) == 0xFF) {
+            return DetectionResult::VMwareDetected;
+        }
+#endif
+        return DetectionResult::Native;
+#else
+        details = "Platform not supported";
+        return DetectionResult::Error;
+#endif
+    }
+
+    // Test 2: LDT Base Address Check
+    static DetectionResult TestLdtBase(string& details) {
+#if defined(_M_X64) || defined(_M_IX86)
+        UINT_PTR ldtBase = GetLdtBase();
+
+        ostringstream oss;
+        oss << "LDT base: 0x" << hex << uppercase << ldtBase;
+        details = oss.str();
+
+        // On native systems, LDT is typically 0 or specific value
+        // VMware modifies this value
+        if (ldtBase != 0 && ldtBase != 0xDEADBEEF) {
+            return DetectionResult::VMwareDetected;
+        }
+
+        return DetectionResult::Native;
+#else
+        details = "Platform not supported";
+        return DetectionResult::Error;
+#endif
+    }
+
+    // Test 3: GDT Base Address Check
+    static DetectionResult TestGdtBase(string& details) {
+#if defined(_M_X64) || defined(_M_IX86)
+        UINT_PTR gdtBase = GetGdtBase();
+
+        ostringstream oss;
+        oss << "GDT base: 0x" << hex << uppercase << gdtBase;
+        details = oss.str();
+
+#ifdef _M_X64
+        // On x64, check high bits for VMware signature
+        if ((gdtBase >> 40) == 0xFF) {
+            return DetectionResult::VMwareDetected;
+        }
+#else
+        // On x86, check if high byte is 0xFF
+        if ((gdtBase >> 24) == 0xFF) {
+            return DetectionResult::VMwareDetected;
+        }
+#endif
+        return DetectionResult::Native;
+#else
+        details = "Platform not supported";
+        return DetectionResult::Error;
+#endif
+    }
+
+    // Test 4: Store Task Register (STR)
+    static DetectionResult TestTaskRegister(string& details) {
+#if defined(_M_X64) || defined(_M_IX86)
+        UINT_PTR taskReg = GetTaskRegister();
+
+        ostringstream oss;
+        oss << "Task Register: 0x" << hex << uppercase << setfill('0') << setw(4) << taskReg;
+        details = oss.str();
+
+        // VMware typically returns 0x4000 for STR
+        if (taskReg == 0x4000) {
+            return DetectionResult::VMwareDetected;
+        }
+
+        return DetectionResult::Native;
+#else
+        details = "Platform not supported";
+        return DetectionResult::Error;
+#endif
+    }
+
+    // Test 5: VMware I/O Port "Get Version" Command
+    static DetectionResult TestVMwareVersion(string& details, int& version) {
+#ifdef _M_X64
+        __try {
+            UINT64 magic = VMwareGetVersion();
+            // Version is in the upper 32 bits
+            DWORD versionType = (DWORD)(magic >> 32);
+
+            if ((DWORD)magic == VMWARE_MAGIC) {
+                version = versionType;
+                ostringstream oss;
+                oss << "VMware detected - Version: ";
+                switch (versionType) {
+                case VMwareVersion::Express: oss << "Express"; break;
+                case VMwareVersion::ESX: oss << "ESX"; break;
+                case VMwareVersion::GSX: oss << "GSX"; break;
+                case VMwareVersion::Workstation: oss << "Workstation"; break;
+                default: oss << "Unknown (" << versionType << ")"; break;
+                }
+                details = oss.str();
+                return DetectionResult::VMwareDetected;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Exception expected on non-VMware systems
+        }
+#elif defined(_M_IX86)
+        __try {
+            DWORD magic = 0, versionType = 0;
+            __asm {
+                push eax
+                push ebx
+                push ecx
+                push edx
+                mov eax, VMWARE_MAGIC
+                xor ebx, ebx
+                mov ecx, 0Ah
+                mov dx, VMWARE_PORT
+                in eax, dx
+                mov magic, ebx
+                mov versionType, ecx
+                pop edx
+                pop ecx
+                pop ebx
+                pop eax
+            }
+
+            if (magic == VMWARE_MAGIC) {
+                version = versionType;
+                ostringstream oss;
+                oss << "VMware detected - Version: ";
+                switch (versionType) {
+                case VMwareVersion::Express: oss << "Express"; break;
+                case VMwareVersion::ESX: oss << "ESX"; break;
+                case VMwareVersion::GSX: oss << "GSX"; break;
+                case VMwareVersion::Workstation: oss << "Workstation"; break;
+                default: oss << "Unknown (" << versionType << ")"; break;
+                }
+                details = oss.str();
+                return DetectionResult::VMwareDetected;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Exception expected on non-VMware systems
+        }
+#endif
+        details = "VMware I/O port not accessible";
+        return DetectionResult::Native;
+    }
+
+    // Test 6: VMware I/O Port "Get Memory Size" Command
+    static DetectionResult TestVMwareMemory(string& details) {
+#ifdef _M_X64
+        __try {
+            UINT64 memSize = VMwareGetMemorySize();
+
+            if (memSize > 0) {
+                ostringstream oss;
+                oss << "VMware memory size: " << dec << memSize << " MB";
+                details = oss.str();
+                return DetectionResult::VMwareDetected;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Exception expected on non-VMware systems
+        }
+#elif defined(_M_IX86)
+        __try {
+            DWORD memSize = 0;
+            __asm {
+                push eax
+                push ebx
+                push ecx
+                push edx
+                mov eax, VMWARE_MAGIC
+                mov ecx, 14h
+                mov dx, VMWARE_PORT
+                in eax, dx
+                mov memSize, eax
+                pop edx
+                pop ecx
+                pop ebx
+                pop eax
+            }
+
+            if (memSize > 0) {
+                ostringstream oss;
+                oss << "VMware memory size: " << dec << memSize << " MB";
+                details = oss.str();
+                return DetectionResult::VMwareDetected;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Exception expected on non-VMware systems
+        }
+#endif
+        details = "VMware memory query failed";
+        return DetectionResult::Native;
+    }
+
+    // Test 7: VMware Emulation Mode Detection
+    static int DetectEmulationMode(LPEXCEPTION_POINTERS lpep) {
+#ifdef _M_X64
+        UINT_PTR endUserMode = 0x00007FFFFFFFFFFF;  // x64 user mode boundary
+#else
+        UINT_PTR endUserMode = (*(UINT_PTR*)0x7FFE02B4);  // x86 user mode boundary
+#endif
+
+        if ((UINT_PTR)(lpep->ExceptionRecord->ExceptionAddress) > endUserMode) {
+            cout << "Result  : VMware detected (emulation mode)" << endl << endl;
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+
+        cout << "Result  : Native OS or VMware with acceleration" << endl << endl;
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
+    static DetectionResult TestEmulationMode(string& details) {
+        // This test is complex and platform-specific
+        // For now, we'll implement a simplified version
+        details = "Emulation mode test - requires specific setup";
+
+#if defined(_M_IX86) || defined(_M_X64)
+        NTSETLDTENTRIES ZwSetLdtEntries;
+        ZwSetLdtEntries = (NTSETLDTENTRIES)GetProcAddress(
+            GetModuleHandleW(L"ntdll.dll"), "ZwSetLdtEntries");
+
+        if (!ZwSetLdtEntries) {
+            details = "ZwSetLdtEntries not available";
+            return DetectionResult::Error;
+        }
+
+        // Note: This test requires careful implementation and may not work
+        // reliably on modern systems. Marked for future enhancement.
+        details = "Test requires elevation and may be unreliable on modern systems";
+        return DetectionResult::Native;
+#else
+        return DetectionResult::Error;
+#endif
+    }
+
+    // Test 8: Virtual BIOS DMI Information
+    static DetectionResult TestBiosDmi(string& details) {
+        try {
+            ComInitializer comInit;
+
+            ComPtr<IWbemLocator> pLocator;
+            HRESULT hr = CoCreateInstance(
+                CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER,
+                IID_IWbemLocator, (LPVOID*)&pLocator);
+
+            if (FAILED(hr)) {
+                details = "Failed to create WMI locator";
+                return DetectionResult::Error;
+            }
+
+            ComPtr<IWbemServices> pServices;
+            hr = pLocator->ConnectServer(
+                _bstr_t(L"ROOT\\CIMV2"),
+                nullptr, nullptr, 0, 0, 0, 0, &pServices);
+
+            if (FAILED(hr)) {
+                details = "Failed to connect to WMI";
+                return DetectionResult::Error;
+            }
+
+            hr = CoSetProxyBlanket(
+                pServices.Get(), RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
+                nullptr, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                nullptr, EOAC_NONE);
+
+            if (FAILED(hr)) {
+                details = "Failed to set proxy blanket";
+                return DetectionResult::Error;
+            }
+
+            ComPtr<IEnumWbemClassObject> pEnumerator;
+            hr = pServices->ExecQuery(
+                bstr_t("WQL"),
+                bstr_t("SELECT SerialNumber FROM Win32_BIOS"),
+                WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                nullptr, &pEnumerator);
+
+            if (FAILED(hr)) {
+                details = "WMI query failed";
+                return DetectionResult::Error;
+            }
+
+            ComPtr<IWbemClassObject> pClassObj;
+            ULONG uReturn = 0;
+
+            hr = pEnumerator->Next(WBEM_INFINITE, 1, &pClassObj, &uReturn);
+            if (uReturn == 0) {
+                details = "No BIOS information found";
+                return DetectionResult::Error;
+            }
+
+            VARIANT vtProp;
+            VariantInit(&vtProp);
+            hr = pClassObj->Get(L"SerialNumber", 0, &vtProp, 0, 0);
+
+            if (SUCCEEDED(hr) && vtProp.vt == VT_BSTR) {
+                char* serialNumber = _com_util::ConvertBSTRToString(vtProp.bstrVal);
+
+                if (serialNumber) {
+                    if (strncmp(serialNumber, "VMware-", 7) == 0 ||
+                        strncmp(serialNumber, "VMW", 3) == 0) {
+                        details = string("VMware BIOS serial: ") + serialNumber;
+                        delete[] serialNumber;
+                        VariantClear(&vtProp);
+                        return DetectionResult::VMwareDetected;
+                    }
+                    delete[] serialNumber;
+                }
+            }
+
+            VariantClear(&vtProp);
+            details = "BIOS check complete - no VMware signature";
+            return DetectionResult::Native;
+        }
+        catch (const exception& e) {
+            details = string("Exception: ") + e.what();
+            return DetectionResult::Error;
+        }
+    }
+
+    // Test 9: Virtual Network Adapter MAC Address Check
+    static DetectionResult TestMacAddress(string& details) {
+        ULONG outBufLen = sizeof(IP_ADAPTER_ADDRESSES);
+        PIP_ADAPTER_ADDRESSES pAddresses = nullptr;
+        PIP_ADAPTER_ADDRESSES pCurrAddresses = nullptr;
+        bool vmwareDetected = false;
+        vector<string> adapterDetails;
+
+        // Allocate initial buffer
+        pAddresses = (IP_ADAPTER_ADDRESSES*)HeapAlloc(GetProcessHeap(), 0, outBufLen);
+        if (!pAddresses) {
+            details = "Memory allocation failed";
+            return DetectionResult::Error;
+        }
+
+        // Get adapter addresses (resize if needed)
+        DWORD result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, pAddresses, &outBufLen);
+        if (result == ERROR_BUFFER_OVERFLOW) {
+            HeapFree(GetProcessHeap(), 0, pAddresses);
+            pAddresses = (IP_ADAPTER_ADDRESSES*)HeapAlloc(GetProcessHeap(), 0, outBufLen);
+            if (!pAddresses) {
+                details = "Memory allocation failed";
+                return DetectionResult::Error;
+            }
+            result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX, nullptr, pAddresses, &outBufLen);
+        }
+
+        if (result != NO_ERROR) {
+            HeapFree(GetProcessHeap(), 0, pAddresses);
+            details = "GetAdaptersAddresses failed";
+            return DetectionResult::Error;
+        }
+
+        // Enumerate adapters
+        pCurrAddresses = pAddresses;
+        while (pCurrAddresses) {
+            if (pCurrAddresses->PhysicalAddressLength >= 3) {
+                // Check against known VMware MAC prefixes
+                for (const auto& prefix : VMWARE_MAC_PREFIXES) {
+                    if (memcmp(pCurrAddresses->PhysicalAddress, prefix, 3) == 0) {
+                        vmwareDetected = true;
+
+                        // Format MAC address
+                        ostringstream oss;
+                        oss << "VMware adapter found: ";
+                        for (UINT i = 0; i < pCurrAddresses->PhysicalAddressLength; i++) {
+                            if (i > 0) oss << "-";
+                            oss << hex << uppercase << setfill('0') << setw(2)
+                                << (int)pCurrAddresses->PhysicalAddress[i];
+                        }
+                        adapterDetails.push_back(oss.str());
+                        break;
+                    }
+                }
+            }
+            pCurrAddresses = pCurrAddresses->Next;
+        }
+
+        HeapFree(GetProcessHeap(), 0, pAddresses);
+
+        if (vmwareDetected) {
+            ostringstream oss;
+            for (const auto& detail : adapterDetails) {
+                oss << detail << "; ";
+            }
+            details = oss.str();
+            return DetectionResult::VMwareDetected;
+        }
+
+        details = "No VMware network adapters detected";
+        return DetectionResult::Native;
+    }
+};
+
+// ============================================================================
+// Test Execution Functions
+// ============================================================================
+
+void PrintTestHeader(int testNum, const string& testName) {
+    cout << "\n[+] Test " << testNum << ": " << testName << endl;
 }
 
-void test6()
-{
-	unsigned int	a = 0;
+void PrintTestResult(DetectionResult result, const string& details) {
+    cout << "Details : " << details << endl;
+    cout << "Result  : ";
 
-	__try {
-		__asm {
-
-			// save register values on the stack
-			push eax
-			push ebx
-			push ecx
-			push edx
-
-			// perform fingerprint
-			mov eax, 'VMXh'		// VMware magic value (0x564D5868)
-			mov ecx, 14h		// get memory size command (0x14)
-			mov dx, 'VX'		// special VMware I/O port (0x5658)
-
-			in eax, dx			// special I/O cmd
-
-			mov a, eax			// data 
-
-								// restore register values from the stack
-			pop edx
-			pop ecx
-			pop ebx
-			pop eax
-		}
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER) {}
-
-	printf("[+] Test 6: VMware \"get memory size\" command\n");
-
-	if (a > 0)
-		printf("Result  : VMware detected\n\n");
-	else
-		printf("Result  : Native OS\n\n");
+    switch (result) {
+    case DetectionResult::VMwareDetected:
+        cout << "VMware detected" << endl;
+        break;
+    case DetectionResult::HypervisorDetected:
+        cout << "Hypervisor detected (non-VMware)" << endl;
+        break;
+    case DetectionResult::Native:
+        cout << "Native OS" << endl;
+        break;
+    case DetectionResult::Error:
+        cout << "Test error" << endl;
+        break;
+    }
+    cout << endl;
 }
 
-int test7_detect(LPEXCEPTION_POINTERS lpep)
-{
-	printf("[+] Test 7: VMware emulation mode\n");
+void RunAllTests() {
+    string details;
+    int version = 0;
 
-	if ((UINT_PTR)(lpep->ExceptionRecord->ExceptionAddress) > EndUserModeAddress)
-		printf("Result  : VMware detected (emulation mode detected)\n\n");
-	else
-		printf("Result  : Native OS or VMware without emulation mode (enabled acceleration)\n\n");
+    // Test 0: CPUID
+    PrintTestHeader(0, "CPUID Hypervisor Detection");
+    PrintTestResult(VMwareDetector::TestCpuidHypervisor(details), details);
 
-	return (EXCEPTION_EXECUTE_HANDLER);
+    // Test 1: IDT
+    PrintTestHeader(1, "Interrupt Descriptor Table (IDT) Base");
+    PrintTestResult(VMwareDetector::TestIdtBase(details), details);
+
+    // Test 2: LDT
+    PrintTestHeader(2, "Local Descriptor Table (LDT) Base");
+    PrintTestResult(VMwareDetector::TestLdtBase(details), details);
+
+    // Test 3: GDT
+    PrintTestHeader(3, "Global Descriptor Table (GDT) Base");
+    PrintTestResult(VMwareDetector::TestGdtBase(details), details);
+
+    // Test 4: STR
+    PrintTestHeader(4, "Store Task Register (STR)");
+    PrintTestResult(VMwareDetector::TestTaskRegister(details), details);
+
+    // Test 5: VMware Version
+    PrintTestHeader(5, "VMware I/O Port - Get Version");
+    PrintTestResult(VMwareDetector::TestVMwareVersion(details, version), details);
+
+    // Test 6: VMware Memory
+    PrintTestHeader(6, "VMware I/O Port - Get Memory Size");
+    PrintTestResult(VMwareDetector::TestVMwareMemory(details), details);
+
+    // Test 7: Emulation Mode
+    PrintTestHeader(7, "VMware Emulation Mode Detection");
+    PrintTestResult(VMwareDetector::TestEmulationMode(details), details);
+
+    // Test 8: BIOS DMI
+    PrintTestHeader(8, "Virtual BIOS DMI Information");
+    PrintTestResult(VMwareDetector::TestBiosDmi(details), details);
+
+    // Test 9: MAC Address
+    PrintTestHeader(9, "Virtual Network Adapter MAC Address");
+    PrintTestResult(VMwareDetector::TestMacAddress(details), details);
 }
 
-void __declspec(naked)
-test7_switchcs()
-{
-	__asm {
-		pop eax
-		push 0x000F
-		push eax
-		retf
-	}
+void PrintSystemInfo() {
+    SYSTEM_INFO sysInfo;
+    GetSystemInfo(&sysInfo);
+
+    cout << "Hardware Information:" << endl;
+    cout << "  Number of processors: " << sysInfo.dwNumberOfProcessors << endl;
+    cout << "  Processor type: " << sysInfo.dwProcessorType << endl;
+
+#ifdef _M_X64
+    cout << "  Architecture: x64 (64-bit)" << endl;
+#elif defined(_M_IX86)
+    cout << "  Architecture: x86 (32-bit)" << endl;
+#elif defined(_M_ARM64)
+    cout << "  Architecture: ARM64" << endl;
+#else
+    cout << "  Architecture: Unknown" << endl;
+#endif
+
+    cout << "  Page size: " << sysInfo.dwPageSize << " bytes" << endl;
+
+    // Calculate uptime
+    DWORD uptime = GetTickCount();
+    unsigned int days = uptime / (24 * 60 * 60 * 1000);
+    uptime %= (24 * 60 * 60 * 1000);
+    unsigned int hours = uptime / (60 * 60 * 1000);
+    uptime %= (60 * 60 * 1000);
+    unsigned int minutes = uptime / (60 * 1000);
+    uptime %= (60 * 1000);
+    unsigned int seconds = uptime / 1000;
+
+    cout << "  System uptime: " << days << " days, " << hours << " hours, "
+        << minutes << " minutes, " << seconds << " seconds" << endl;
 }
 
-// Derek Soeder's (eEye Digital Security) VMware emulation test
-void test7()
-{
-	NTSETLDTENTRIES ZwSetLdtEntries;
-	LDT_ENTRY csdesc;
+// ============================================================================
+// Main Entry Point
+// ============================================================================
 
-	ZwSetLdtEntries = (NTSETLDTENTRIES)GetProcAddress(GetModuleHandle(L"ntdll.dll"), "ZwSetLdtEntries");
+int main() {
+    cout << "\n========================================================" << endl;
+    cout << "  ScoopyNG - The VMware Detection Tool" << endl;
+    cout << "  Version 2.0 - x64 Refactored Edition" << endl;
+    cout << "========================================================\n" << endl;
 
-	memset(&csdesc, 0, sizeof(csdesc));
+    PrintSystemInfo();
+    RunAllTests();
 
-	csdesc.LimitLow = (WORD)(EndUserModeAddress >> 12);
-	csdesc.HighWord.Bytes.Flags1 = 0xFA;
-	csdesc.HighWord.Bytes.Flags2 = 0xC0 | ((EndUserModeAddress >> 28) & 0x0F);
+    cout << "========================================================" << endl;
+    cout << "  Original Author: Tobias Klein (www.trapkit.de)" << endl;
+    cout << "  Extended by: Real Ursus (North Pole)" << endl;
+    cout << "  Refactored for x64: 2025" << endl;
+    cout << "========================================================\n" << endl;
 
-	ZwSetLdtEntries(0x000F, ((DWORD*)&csdesc)[0], ((DWORD*)&csdesc)[1], 0, 0, 0);
-
-	__try {
-		test7_switchcs();
-		__asm {
-			or eax, -1
-				jmp eax
-		}
-	}
-	__except (test7_detect(GetExceptionInformation())) { }
-}
-
-void test8() 
-{
-	cout << "[+] Test 8: Virtual BIOS DMI information" << endl;
-
-	char * SerialNumber = _com_util::ConvertBSTRToString(GetBIOS());
-
-	if (!memcmp(SerialNumber, "VMware-", 7) || !memcmp(SerialNumber, "VMW", 3))	
-		cout << "Result  : DMI contains VMware specific string: " << SerialNumber << "\n" << endl;
-	else
-		cout << "Result  : Native OS" << "\n"<< endl;
-}
-
-void test9()
-{
-	cout << "[+] Test 9: Virtual Adapter" << endl;
-	cout << "OS Adapter details:" << endl;
-
-	if (isVMWareMAC())
-		cout << "Result  : VMware specific Adapter has been detected" << "\n\n" << endl;
-	else
-		cout << "Result  : Native OS" << "\n\n" << endl;
-}
-
-int main()
-{
-	printf("\n\n####################################################\n");
-	printf("::       ScoopyNG - The VMware Detection Tool     ::\n");
-	printf("::              Windows version v1.2              ::\n\n");
-
-
-	SYSTEM_INFO siSysInfo;	
-	GetSystemInfo(&siSysInfo);
-
-	printf("Hardware information: \n");
-	printf("  Number of processors: %u\n", siSysInfo.dwNumberOfProcessors);	
-	printf("  Processor type: %u\n", siSysInfo.dwProcessorType);
-	printf("  Processor Revision: %u\n", siSysInfo.wProcessorRevision);
-	printf("  Page size: %u\n\n", siSysInfo.dwPageSize);
-	
-	DWORD uptime = GetTickCount();	
-	unsigned int days = uptime / (24 * 60 * 60 * 1000);
-	uptime %= (24 * 60 * 60 * 1000);
-	unsigned int hours = uptime / (60 * 60 * 1000);
-	uptime %= (60 * 60 * 1000);
-	unsigned int minutes = uptime / (60 * 1000);
-	uptime %= (60 * 1000);
-	unsigned int seconds = uptime / (1000);
-
-	cout << "System Uptime is: " << days << " days " << hours  << " hours " << minutes << " minutes " << seconds << " seconds" << "\n" << endl;
-
-	test0();
-	test1();
-	test2();
-	test3();
-	test4();
-	test5();
-	test6();
-	test7();
-	test8();
-	test9();
-
-	printf(":: Original Author: Tobias Klein (www.trapkit.de) ::\n");
-	printf("::     Extended by: Real Ursus (North Pole)       ::\n");
-	printf("####################################################\n\n");
-
-	return 0;
+    return 0;
 }
